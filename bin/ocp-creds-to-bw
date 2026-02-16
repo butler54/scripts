@@ -1,0 +1,171 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Extract OpenShift credentials from a remote host and upsert into Bitwarden.
+#
+# Usage: ocp-creds-to-bw <ssh-host> <remote-install-dir> [bw-item-name]
+
+##############################################################################
+# Argument parsing
+##############################################################################
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+    echo "Usage: $0 <ssh-host> <remote-install-dir> [bw-item-name]" >&2
+    echo "Example: $0 myvm.example.com ~/coco-pattern/openshift-install" >&2
+    echo "Example: $0 myvm.example.com ~/coco-pattern/openshift-install-hub openshift-coco-hub" >&2
+    exit 1
+fi
+
+SSH_HOST="$1"
+REMOTE_DIR="$2"
+BW_ITEM_NAME="${3:-}"
+
+##############################################################################
+# Prerequisite checks
+##############################################################################
+for cmd in bw jq; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "Error: '$cmd' is required but not installed." >&2
+        exit 1
+    fi
+done
+
+##############################################################################
+# Bitwarden session handling
+##############################################################################
+bw_status=$(bw status 2>/dev/null | jq -r '.status')
+
+case "$bw_status" in
+    unauthenticated)
+        echo "Error: Bitwarden vault is not logged in." >&2
+        echo "Please run: bw login" >&2
+        exit 1
+        ;;
+    locked)
+        echo "Bitwarden vault is locked. Unlocking..."
+        BW_SESSION=$(bw unlock --raw)
+        export BW_SESSION
+        ;;
+    unlocked)
+        # If BW_SESSION is already in the environment, use it; otherwise export empty
+        export BW_SESSION="${BW_SESSION:-}"
+        ;;
+    *)
+        echo "Error: Unexpected Bitwarden status '$bw_status'." >&2
+        exit 1
+        ;;
+esac
+
+# Helper: run bw commands with session
+bw_cmd() {
+    if [[ -n "$BW_SESSION" ]]; then
+        bw --session "$BW_SESSION" "$@"
+    else
+        bw "$@"
+    fi
+}
+
+##############################################################################
+# SSH: extract credentials from remote host
+##############################################################################
+echo "Extracting credentials from ${SSH_HOST}:${REMOTE_DIR} ..."
+
+KUBEADMIN_PASSWORD=$(ssh "$SSH_HOST" "cat '${REMOTE_DIR}/auth/kubeadmin-password'" 2>/dev/null) || true
+if [[ -z "$KUBEADMIN_PASSWORD" ]]; then
+    echo "Error: Could not read ${REMOTE_DIR}/auth/kubeadmin-password on ${SSH_HOST}" >&2
+    exit 1
+fi
+
+KUBECONFIG_CONTENT=$(ssh "$SSH_HOST" "cat '${REMOTE_DIR}/auth/kubeconfig'" 2>/dev/null) || true
+if [[ -z "$KUBECONFIG_CONTENT" ]]; then
+    echo "Error: Could not read ${REMOTE_DIR}/auth/kubeconfig on ${SSH_HOST}" >&2
+    exit 1
+fi
+
+##############################################################################
+# Parse API server URL from kubeconfig
+##############################################################################
+if command -v yq &>/dev/null; then
+    API_URL=$(echo "$KUBECONFIG_CONTENT" | yq eval '.clusters[0].cluster.server' -)
+else
+    API_URL=$(echo "$KUBECONFIG_CONTENT" | grep -m1 'server:' | awk '{print $2}')
+fi
+
+if [[ -z "$API_URL" ]]; then
+    echo "Error: Could not extract API server URL from kubeconfig." >&2
+    exit 1
+fi
+
+##############################################################################
+# Derive OAuth URL and cluster name from API URL
+##############################################################################
+# API URL format: https://api.<cluster>.<basedomain>:6443
+API_HOSTNAME=$(echo "$API_URL" | sed -E 's|https?://||; s|:[0-9]+$||')
+
+if [[ "$API_HOSTNAME" != api.* ]]; then
+    echo "Error: API hostname '${API_HOSTNAME}' does not start with 'api.' — unexpected format." >&2
+    exit 1
+fi
+
+# Strip leading "api." to get <cluster>.<basedomain>
+CLUSTER_DOMAIN="${API_HOSTNAME#api.}"
+
+# Cluster name is the first segment
+CLUSTER_NAME="${CLUSTER_DOMAIN%%.*}"
+
+OAUTH_URL="https://oauth-openshift.apps.${CLUSTER_DOMAIN}"
+
+##############################################################################
+# Auto-generate BW item name if not provided
+##############################################################################
+if [[ -z "$BW_ITEM_NAME" ]]; then
+    BW_ITEM_NAME="openshift-${CLUSTER_NAME}"
+fi
+
+echo "Cluster:   ${CLUSTER_NAME}"
+echo "API URL:   ${API_URL}"
+echo "OAuth URL: ${OAUTH_URL}"
+echo "BW item:   ${BW_ITEM_NAME}"
+
+##############################################################################
+# Sync and upsert Bitwarden item
+##############################################################################
+echo "Syncing Bitwarden vault..."
+bw_cmd sync &>/dev/null || true
+
+# Check if item already exists
+EXISTING_ITEM=$(bw_cmd get item "$BW_ITEM_NAME" 2>/dev/null) || true
+
+if [[ -n "$EXISTING_ITEM" ]]; then
+    echo "Updating existing Bitwarden item '${BW_ITEM_NAME}'..."
+    ITEM_ID=$(echo "$EXISTING_ITEM" | jq -r '.id')
+
+    UPDATED_ITEM=$(echo "$EXISTING_ITEM" | jq \
+        --arg pw "$KUBEADMIN_PASSWORD" \
+        --arg user "kubeadmin" \
+        --arg uri "$OAUTH_URL" \
+        '.login.username = $user
+         | .login.password = $pw
+         | .login.uris = [{"match": null, "uri": $uri}]')
+
+    echo "$UPDATED_ITEM" | bw_cmd encode | bw_cmd edit item "$ITEM_ID" &>/dev/null
+    echo "Updated."
+else
+    echo "Creating new Bitwarden item '${BW_ITEM_NAME}'..."
+    NEW_ITEM=$(jq -n \
+        --arg name "$BW_ITEM_NAME" \
+        --arg user "kubeadmin" \
+        --arg pw "$KUBEADMIN_PASSWORD" \
+        --arg uri "$OAUTH_URL" \
+        '{
+            type: 1,
+            name: $name,
+            login: {
+                username: $user,
+                password: $pw,
+                uris: [{"match": null, "uri": $uri}]
+            }
+        }')
+
+    echo "$NEW_ITEM" | bw_cmd encode | bw_cmd create item &>/dev/null
+    echo "Created."
+fi

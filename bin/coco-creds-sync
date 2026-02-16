@@ -1,0 +1,90 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Discover all OpenShift install directories on a CoCo dev VM and sync
+# their credentials into Bitwarden.
+#
+# Usage: coco-creds-sync
+#
+# Environment variables:
+#   COCO_VM_HOST   (required) — SSH host for the dev VM
+#   COCO_REMOTE_PATH (optional, default: ~/coco-pattern)
+
+##############################################################################
+# Configuration
+##############################################################################
+if [[ -z "${COCO_VM_HOST:-}" ]]; then
+    echo "Error: COCO_VM_HOST environment variable is not set." >&2
+    echo "Set it to the SSH host of your dev VM, e.g.:" >&2
+    echo "  export COCO_VM_HOST=myvm.example.com" >&2
+    exit 1
+fi
+
+REMOTE_PATH="${COCO_REMOTE_PATH:-~/coco-pattern}"
+SCRIPT_DIR="${0:a:h}"
+
+##############################################################################
+# Discover install directories
+##############################################################################
+echo "Discovering OpenShift install directories on ${COCO_VM_HOST}:${REMOTE_PATH} ..."
+
+INSTALL_DIRS=$(ssh "$COCO_VM_HOST" \
+    "find ${REMOTE_PATH} -maxdepth 2 -path '*/openshift-install*/auth/kubeconfig' -print 2>/dev/null" \
+    | sed 's|/auth/kubeconfig$||') || true
+
+if [[ -z "$INSTALL_DIRS" ]]; then
+    echo "No openshift-install*/auth/kubeconfig paths found under ${REMOTE_PATH}."
+    echo "Nothing to sync."
+    exit 0
+fi
+
+##############################################################################
+# Process each directory
+##############################################################################
+RESULT_FILE=$(mktemp)
+trap "rm -f '$RESULT_FILE'" EXIT
+
+# Convert to array to avoid subshell issues
+install_dirs=("${(@f)INSTALL_DIRS}")
+
+echo ""
+echo "Found install directories:"
+for dir in "${install_dirs[@]}"; do
+    [[ -z "$dir" ]] && continue
+    echo "  $dir"
+done
+echo ""
+
+for install_dir in "${install_dirs[@]}"; do
+    [[ -z "$install_dir" ]] && continue
+
+    echo "========================================"
+    echo "Processing: ${install_dir}"
+    echo "========================================"
+
+    if "${SCRIPT_DIR}/ocp-creds-to-bw" "$COCO_VM_HOST" "$install_dir"; then
+        echo "ok" >> "$RESULT_FILE"
+    else
+        echo "fail" >> "$RESULT_FILE"
+        echo "FAILED: ${install_dir}" >&2
+    fi
+    echo ""
+done
+
+##############################################################################
+# Summary
+##############################################################################
+TOTAL=$(wc -l < "$RESULT_FILE" | tr -d ' ')
+S=$(grep -c '^ok$' "$RESULT_FILE" 2>/dev/null || echo 0)
+F=$(grep -c '^fail$' "$RESULT_FILE" 2>/dev/null || echo 0)
+
+echo "========================================"
+echo "Sync complete."
+echo "  Directories processed: ${TOTAL}"
+echo "  Succeeded: ${S}"
+echo "  Failed:    ${F}"
+echo "========================================"
+
+if [[ "$F" -gt 0 ]]; then
+    exit 1
+fi
